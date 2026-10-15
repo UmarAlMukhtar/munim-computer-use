@@ -1,15 +1,21 @@
-name: Publish to MCP Registry
+name: Publish to npm and the MCP Registry
 
-# The npm launcher (munim-computer-use) is published from a maintainer machine
-# first; this job then registers the matching version with the official MCP
-# Registry using GitHub OIDC for the io.github.munimtechnologies namespace.
+# Publishing the GitHub release pushes its tag, which runs this: the npm
+# launcher (munim-computer-use) is published with npm trusted publishing, then
+# the matching version is registered with the official MCP Registry. Both log
+# in with this job's GitHub OIDC token, so no npm token is stored anywhere and
+# no maintainer machine needs to be logged in to npm. npm trusts this workflow
+# by file name (`npm trust list munim-computer-use`); renaming it breaks that.
+#
+# The launcher downloads the binaries from the release, so publish the release
+# only once its assets are uploaded (see release-assets.yml).
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to publish (must already exist on npm and Releases)"
+        description: "Version to publish (its release and tag must already exist); npm is skipped if already there"
         required: true
 
 jobs:
@@ -19,7 +25,33 @@ jobs:
       id-token: write
       contents: read
     steps:
+      - name: Resolve the version
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          if [ -z "$VERSION" ]; then VERSION="${GITHUB_REF#refs/tags/v}"; fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+      # The tagged source, also when dispatched by hand from the default branch.
       - uses: actions/checkout@v7
+        with:
+          ref: v${{ env.VERSION }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Publish the npm launcher
+        working-directory: npm
+        run: |
+          set -eu
+          packaged=$(node -p 'require("./package.json").version')
+          test "$packaged" = "$VERSION" || { echo "npm/package.json is $packaged, not $VERSION"; exit 1; }
+          # Trusted publishing needs npm 11.5.1 or later.
+          node -e 'const [a,b,c]=process.argv[1].split(".").map(Number); process.exit(a>11||(a===11&&(b>5||(b===5&&c>=1)))?0:1)' "$(npm --version)" \
+            || { echo "npm $(npm --version) is too old for trusted publishing"; exit 1; }
+          if npm view "munim-computer-use@$VERSION" version >/dev/null 2>&1; then
+            echo "munim-computer-use@$VERSION is already on npm"
+          else
+            npm publish --access public
+          fi
       - name: Install mcp-publisher
         # Pinned to a release and checked against its published digest, so a
         # compromised or changed "latest" cannot run with the OIDC token.
@@ -34,8 +66,6 @@ jobs:
           tar xzf mcp-publisher.tar.gz mcp-publisher
       - name: Set version in server.json
         run: |
-          VERSION="${{ github.event.inputs.version }}"
-          if [ -z "$VERSION" ]; then VERSION="${GITHUB_REF#refs/tags/v}"; fi
           jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp && mv server.tmp server.json
           cat server.json
       - name: Validate
