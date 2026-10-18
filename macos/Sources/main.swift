@@ -4473,7 +4473,7 @@ func advertisedToolDefs() -> [[String: Any]] {
 
 // MARK: - Server identity
 
-let serverVersion = "0.7.1"
+let serverVersion = "0.7.2"
 /// Protocol revisions this server speaks. A client asking for one gets it
 /// echoed back; anything else gets the oldest, which every client understands.
 let supportedProtocolVersions: Set<String> = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
