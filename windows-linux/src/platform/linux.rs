@@ -37,6 +37,9 @@ const BUTTON_SCROLL_DOWN: u8 = 5;
 const BUTTON_SCROLL_LEFT: u8 = 6;
 const BUTTON_SCROLL_RIGHT: u8 = 7;
 
+/// How long a pointer rests on its target before a button press.
+const POINTER_SETTLE: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Where an element lives on the AT-SPI bus. Proxies borrow their connection,
 /// so the registry stores addresses and rebuilds a proxy on demand.
 #[derive(Clone, Debug)]
@@ -495,6 +498,15 @@ impl LinuxDesktop {
         Ok(())
     }
 
+    /// Move the pointer to where a press will land. GTK can drop a press that
+    /// arrives before it has handled the pointer crossing into the widget
+    /// (seen with plain buttons under bspwm), so give it a moment first.
+    fn move_pointer_to_press(&self, x: f64, y: f64) -> Result<()> {
+        self.move_pointer(x, y)?;
+        std::thread::sleep(POINTER_SETTLE);
+        Ok(())
+    }
+
     fn button(&self, button: u8, press: bool) -> Result<()> {
         let (connection, screen) = self.x11()?;
         let root = connection.setup().roots[*screen].root;
@@ -509,8 +521,6 @@ impl LinuxDesktop {
     }
 
     fn tap_button(&self, button: u8) -> Result<()> {
-        // Let the target process pointer crossing before the press.
-        std::thread::sleep(std::time::Duration::from_millis(20));
         self.button(button, true)?;
         self.button(button, false)
     }
@@ -1064,40 +1074,54 @@ fn to_xtest_coord(value: f64, axis: &str) -> Result<i16> {
 // AT-SPI can contain only some running apps. Keep X11-only windows available
 // for screenshots and coordinate input, even while the accessibility bus works.
 fn format_linux_app_list(accessible: Vec<(String, u32)>, windows: Vec<super::AppInfo>) -> String {
-    let focused = windows.iter().find(|app| app.frontmost);
-    let mut lines: Vec<String> = accessible.iter()
-        .filter(|(name, _)| !name.is_empty())
+    let accessible: Vec<(String, u32)> =
+        accessible.into_iter().filter(|(name, _)| !name.is_empty()).collect();
+    // A window whose pid the bus also reports is listed once, as the bus entry.
+    let (merged, remaining): (Vec<_>, Vec<_>) = windows
+        .into_iter()
+        .partition(|app| app.pid != 0 && accessible.iter().any(|(_, pid)| *pid == app.pid));
+    // The marker follows the focused window: onto its bus entry when the pids
+    // match, otherwise it stays on the window's own line, so it appears once.
+    let focused_pid = merged.iter().find(|app| app.frontmost).map(|app| app.pid);
+
+    let mut entries: Vec<(bool, String)> = accessible
+        .iter()
         .map(|(name, pid)| {
-            let frontmost = focused.is_some_and(|app| {
-                if app.pid != 0 && *pid != 0 {
-                    app.pid == *pid
-                } else {
-                    app.name.eq_ignore_ascii_case(name)
-                }
-            });
+            let frontmost = focused_pid == Some(*pid);
             let marker = if frontmost { "  FRONTMOST" } else { "" };
             let name = super::escape_app_field(name);
-            if *pid == 0 {
+            let line = if *pid == 0 {
                 format!("{name}  [a11y]{marker}")
             } else {
                 format!("{name}  [a11y]  pid={pid}{marker}")
-            }
-        }).collect();
-    let remaining = windows.into_iter().filter(|app| {
-        !accessible.iter().any(|(name, pid)| !name.is_empty() && *pid != 0 && *pid == app.pid)
-    }).collect::<Vec<_>>();
+            };
+            (frontmost, line)
+        })
+        .collect();
+    let mut notes = Vec::new();
     if !remaining.is_empty() {
-        lines.extend(format_app_list(remaining).lines().map(str::to_owned));
+        // Window lines end in `windows=N` or a quoted title unless marked.
+        for line in format_app_list(remaining).lines() {
+            if line.starts_with("note: ") {
+                notes.push(line.to_owned());
+            } else {
+                entries.push((line.ends_with("  FRONTMOST"), line.to_owned()));
+            }
+        }
     }
-    lines.sort_by_key(|line| (!line.contains("FRONTMOST"), line.to_lowercase()));
-    lines.join("\n")
+    entries.sort_by_key(|(frontmost, line)| (!frontmost, line.to_lowercase()));
+    entries.into_iter().map(|(_, line)| line).chain(notes).collect::<Vec<_>>().join("\n")
 }
 
 impl Desktop for LinuxDesktop {
     fn list_apps(&mut self) -> Result<String> {
         let windows = apps::list_apps();
-        let accessible = self.applications().unwrap_or_default().into_iter()
-            .map(|(_, name, pid)| (name, pid)).collect::<Vec<_>>();
+        let accessible: Vec<(String, u32)> = self
+            .applications()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, name, pid)| (name, pid))
+            .collect();
         // Minimal WMs may not publish the EWMH properties xcap needs.
         if accessible.iter().all(|(name, _)| name.is_empty()) {
             return Ok(format_app_list(windows?));
@@ -1293,7 +1317,7 @@ impl Desktop for LinuxDesktop {
 
         let (x, y) = self.point_coordinates(target)?;
         AgentCursor::shared().press(x, y);
-        self.move_pointer(x, y)?;
+        self.move_pointer_to_press(x, y)?;
         for _ in 0..click_count.max(1) {
             self.tap_button(BUTTON_LEFT)?;
         }
@@ -1311,7 +1335,7 @@ impl Desktop for LinuxDesktop {
         self.ensure_accessibility();
         let (x, y) = self.point_coordinates(target)?;
         AgentCursor::shared().press(x, y);
-        self.move_pointer(x, y)?;
+        self.move_pointer_to_press(x, y)?;
         self.button(BUTTON_RIGHT, true)?;
         if let Err(error) = self.button(BUTTON_RIGHT, false) {
             let _ = self.button(BUTTON_RIGHT, false);
@@ -1335,7 +1359,7 @@ impl Desktop for LinuxDesktop {
         let (from_x, from_y) = self.point_coordinates(from)?;
         let (to_x, to_y) = self.point_coordinates(to)?;
         AgentCursor::shared().show(from_x, from_y);
-        self.move_pointer(from_x, from_y)?;
+        self.move_pointer_to_press(from_x, from_y)?;
         // Fly the overlay to the destination *before* button-down so the
         // blocking wait cannot hold a stationary press (Bugbot: drag timing).
         AgentCursor::shared().press(to_x, to_y);
@@ -1390,7 +1414,7 @@ impl Desktop for LinuxDesktop {
                     )));
                 }
                 let clicked = if let Ok((x, y)) = self.center(&reference) {
-                    self.move_pointer(x, y)
+                    self.move_pointer_to_press(x, y)
                         .and_then(|()| self.tap_button(BUTTON_LEFT))
                         .is_ok()
                 } else {
@@ -1531,7 +1555,7 @@ impl Desktop for LinuxDesktop {
             // AT-SPI bounds the same way click / right_click / drag do.
             let (x, y) = self.point_coordinates(Point::Element(id))?;
             AgentCursor::shared().show(x, y);
-            self.move_pointer(x, y)?;
+            self.move_pointer_to_press(x, y)?;
         }
         let button = match direction {
             ScrollDirection::Up => BUTTON_SCROLL_UP,
@@ -1617,6 +1641,21 @@ mod tests {
         assert_eq!(headless, "Panel  [a11y]  pid=33");
         let unknown = super::format_linux_app_list(vec![("Unknown".into(), 0)], vec![window(22, false)]);
         assert!(unknown.contains("pid=22"));
+
+        // A pid-less bus entry with the focused app's name must not take a
+        // second marker from the window line that stays listed.
+        let pidless = super::format_linux_app_list(vec![("Editor".into(), 0)], vec![window(22, true)]);
+        assert_eq!(pidless.matches("FRONTMOST").count(), 1, "{pidless}");
+        assert!(pidless.starts_with("Editor  [editor]  pid=22"), "{pidless}");
+
+        // The duplicate-instance note stays after every app line.
+        let twins = super::format_linux_app_list(
+            vec![("Panel".into(), 33), ("Zeta".into(), 55)],
+            vec![window(22, false), window(44, false)],
+        );
+        let last = twins.lines().last().unwrap_or_default();
+        assert!(last.starts_with("note: 2 instances of Editor"), "{twins}");
+        assert_eq!(twins.lines().filter(|line| line.starts_with("note: ")).count(), 1, "{twins}");
     }
 
     #[test]
