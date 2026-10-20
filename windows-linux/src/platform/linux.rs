@@ -16,7 +16,7 @@ use atspi::{connection::AccessibilityConnection, CoordType, Role, State};
 use futures_lite::future::block_on;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, GetKeyboardMappingReply,
+    AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, GetKeyboardMappingReply,
     InputFocus, Keycode, StackMode,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
@@ -344,6 +344,19 @@ impl LinuxDesktop {
                 DesktopError::new(format!("could not send _NET_ACTIVE_WINDOW: {error}"))
             })?;
 
+        // EWMH is asynchronous: bspwm must map a window on another desktop
+        // before SetInputFocus is legal. Let the WM finish activation first.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        while std::time::Instant::now() < deadline {
+            if let Ok(cookie) = connection.get_property(false, root, atom, AtomEnum::WINDOW, 0, 1)
+                && let Ok(reply) = cookie.reply()
+                && reply.value32().and_then(|mut values| values.next()) == Some(window_id)
+            {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
         // Nudge for WMs (Openbox under Xvfb) that ignore the client message.
         connection
             .set_input_focus(InputFocus::PARENT, window_id, 0u32)
@@ -496,6 +509,8 @@ impl LinuxDesktop {
     }
 
     fn tap_button(&self, button: u8) -> Result<()> {
+        // Let the target process pointer crossing before the press.
+        std::thread::sleep(std::time::Duration::from_millis(20));
         self.button(button, true)?;
         self.button(button, false)
     }
@@ -1046,48 +1061,48 @@ fn to_xtest_coord(value: f64, axis: &str) -> Result<i16> {
     Ok(value as i16)
 }
 
+// AT-SPI can contain only some running apps. Keep X11-only windows available
+// for screenshots and coordinate input, even while the accessibility bus works.
+fn format_linux_app_list(accessible: Vec<(String, u32)>, windows: Vec<super::AppInfo>) -> String {
+    let focused = windows.iter().find(|app| app.frontmost);
+    let mut lines: Vec<String> = accessible.iter()
+        .filter(|(name, _)| !name.is_empty())
+        .map(|(name, pid)| {
+            let frontmost = focused.is_some_and(|app| {
+                if app.pid != 0 && *pid != 0 {
+                    app.pid == *pid
+                } else {
+                    app.name.eq_ignore_ascii_case(name)
+                }
+            });
+            let marker = if frontmost { "  FRONTMOST" } else { "" };
+            let name = super::escape_app_field(name);
+            if *pid == 0 {
+                format!("{name}  [a11y]{marker}")
+            } else {
+                format!("{name}  [a11y]  pid={pid}{marker}")
+            }
+        }).collect();
+    let remaining = windows.into_iter().filter(|app| {
+        !accessible.iter().any(|(name, pid)| !name.is_empty() && *pid != 0 && *pid == app.pid)
+    }).collect::<Vec<_>>();
+    if !remaining.is_empty() {
+        lines.extend(format_app_list(remaining).lines().map(str::to_owned));
+    }
+    lines.sort_by_key(|line| (!line.contains("FRONTMOST"), line.to_lowercase()));
+    lines.join("\n")
+}
+
 impl Desktop for LinuxDesktop {
     fn list_apps(&mut self) -> Result<String> {
-        // Window enumeration needs EWMH properties that minimal window managers
-        // (WSLg included) do not publish, and the accessibility bus is the more
-        // relevant view here anyway: an app absent from it cannot be driven.
-        let focused = apps::list_apps().ok().and_then(|apps| {
-            apps.into_iter().find(|app| app.frontmost)
-        });
-        let focused_name = focused
-            .as_ref()
-            .map(|app| app.name.to_lowercase())
-            .unwrap_or_default();
-        let focused_pid = focused.map(|app| app.pid);
-
-        if let Ok(applications) = self.applications()
-            && !applications.is_empty()
-        {
-            let mut lines: Vec<String> = applications
-                .into_iter()
-                .filter(|(_, name, _)| !name.is_empty())
-                .map(|(_, name, pid)| {
-                    // Prefer pid equality — xcap and AT-SPI names often disagree
-                    // (`Code` vs `Visual Studio Code`). Exact name is the fallback.
-                    let is_frontmost = focused_pid
-                        .filter(|front| *front != 0 && *front == pid)
-                        .is_some()
-                        || (!focused_name.is_empty() && name.to_lowercase() == focused_name);
-
-                    let marker = if is_frontmost { "  FRONTMOST" } else { "" };
-                    if pid == 0 {
-                        format!("{name}  [a11y]{marker}")
-                    } else {
-                        format!("{name}  [a11y]  pid={pid}{marker}")
-                    }
-                })
-                .collect();
-            if !lines.is_empty() {
-                lines.sort_by_key(|line| (!line.contains("FRONTMOST"), line.to_lowercase()));
-                return Ok(lines.join("\n"));
-            }
+        let windows = apps::list_apps();
+        let accessible = self.applications().unwrap_or_default().into_iter()
+            .map(|(_, name, pid)| (name, pid)).collect::<Vec<_>>();
+        // Minimal WMs may not publish the EWMH properties xcap needs.
+        if accessible.iter().all(|(name, _)| name.is_empty()) {
+            return Ok(format_app_list(windows?));
         }
-        Ok(format_app_list(apps::list_apps()?))
+        Ok(format_linux_app_list(accessible, windows.unwrap_or_default()))
     }
 
     fn resolve_pid(&mut self, app: &str) -> Result<u32> {
@@ -1583,6 +1598,26 @@ mod tests {
         char_to_keysym, match_application, modifier_keysym, named_keysym, to_xtest_coord, truncate,
         ElementRef,
     };
+
+    #[test]
+    fn mixed_accessibility_listing_keeps_x11_windows_and_correct_focus() {
+        let window = |pid, focused| super::super::AppInfo {
+            name: "Editor".into(), id: "editor".into(), pid, windows: 1,
+            frontmost: focused, title: format!("Document {pid}"),
+        };
+        let listing = super::format_linux_app_list(
+            vec![("Editor".into(), 11), ("Panel".into(), 33)],
+            vec![window(11, false), window(22, true)],
+        );
+        assert_eq!(listing.matches("pid=11").count(), 1, "{listing}");
+        assert!(listing.contains("pid=22  windows=1  FRONTMOST"), "{listing}");
+        assert!(listing.contains("Panel  [a11y]  pid=33"), "{listing}");
+        assert_eq!(listing.matches("FRONTMOST").count(), 1, "{listing}");
+        let headless = super::format_linux_app_list(vec![("Panel".into(), 33)], vec![]);
+        assert_eq!(headless, "Panel  [a11y]  pid=33");
+        let unknown = super::format_linux_app_list(vec![("Unknown".into(), 0)], vec![window(22, false)]);
+        assert!(unknown.contains("pid=22"));
+    }
 
     #[test]
     fn latin1_characters_map_to_themselves() {

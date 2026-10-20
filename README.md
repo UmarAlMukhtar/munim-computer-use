@@ -311,6 +311,17 @@ Names, argument shapes and descriptions are identical on every platform, and CI 
 
 ### Build from source
 
+On Fedora, install the native development libraries before building the Rust
+server (in addition to your Rust toolchain):
+
+```sh
+sudo dnf install gcc pkgconf-pkg-config clang-devel pipewire-devel \
+  libdrm-devel mesa-libgbm-devel mesa-libEGL-devel wayland-devel libxcb-devel
+```
+
+These are needed by the screen-capture dependencies even on X11. In particular,
+a missing `libpipewire-0.3.pc` during the build means `pipewire-devel` is missing.
+
 ```sh
 # macOS
 cd macos && swift build -c release
